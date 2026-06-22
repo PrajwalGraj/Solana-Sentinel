@@ -4,7 +4,10 @@ use tokio_tungstenite::{connect_async};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use tokio_tungstenite::tungstenite::Message;
-use tokio::time::{sleep, Duration};
+use tokio::{sync::broadcast::error, time::{Duration, sleep}};
+use std::fs;
+use tokio::sync::mpsc;
+use std::sync::Arc;
 
 const DEVNET_HTTP_URL: &str = "https://api.devnet.solana.com";
 const DEVNET_WS_URL: &str = "wss://api.devnet.solana.com";
@@ -18,14 +21,14 @@ struct TransactionDetails{
     wallet_balance_change_lamports: i64,
 }
 
-#[tokio::main]
-async fn main() {
-    let client = reqwest::Client::new();
-    let mut wallet_address = String::new();
-    println!("Enter the Wallet Address:");
-    io::stdin().read_line(&mut wallet_address).expect("Failed to read wallet address");
-    let wallet_address = wallet_address.trim();
+#[derive(Debug)]
+struct WalletEvent {
+    wallet_address: String,
+    slot: u64,
+    lamports: u64,
+}
 
+async fn watch_wallet(wallet_address: String, event_sender: mpsc::Sender<WalletEvent>){
     let (mut ws_stream, _) = connect_async(DEVNET_WS_URL).await.expect("Failed to connect");
 
     println!("Connected!");
@@ -61,52 +64,22 @@ async fn main() {
                 if parsed["method"] == "accountNotification"{
                     let slot = parsed["params"]["result"]["context"]["slot"]
                         .as_u64()
-                        .unwrap_or(0);
+                        .expect("Account notification missing context.slot");
 
                     let lamports = parsed["params"]["result"]["value"]["lamports"]
                         .as_u64()
-                        .unwrap_or(0);
-                    let sol = lamports as f64/1_000_000_000.0;
+                        .expect("Account notification missing value.lamports");
 
-                    println!("\nNew account change detected!");
-                    println!("Wallet: {}", wallet_address);
-                    println!("Slot: {}", slot);
-                    println!("Balance: {:.9} SOL", sol);
-                    println!("Lamports: {}", lamports);
-                    
-                    match fetch_latest_transaction(&client, wallet_address).await{
-                        Ok(Some(signature)) => {
-                            println!("Latest transaction: {}\n", signature);
+                    let event = WalletEvent{
+                        wallet_address: wallet_address.clone(),
+                        slot,
+                        lamports
+                    };
 
-                            match fetch_transaction_with_retry(&client, &signature, wallet_address).await{
-                                Ok(Some(tnx_details)) =>{
-                                    println!("\nTransaction details");
-                                    println!("Success: {}", if tnx_details.success { "Success" } else { "Failed" });
-                                    println!("Slot: {}",tnx_details.slot);
-                                    println!("Fee: {} SOL",tnx_details.fee as f64 / 1_000_000_000.0);
-                                    println!("Block-Time: {:?}",tnx_details.block_time);
-                                    println!("Wallet SOL change: {:.9} SOL",tnx_details.wallet_balance_change_lamports as f64 / 1_000_000_000.0);
-
-                                }
-                                Ok(None)=>{
-                                    println!("Transaction details are not available.");
-                                }
-                                Err(error)=>{
-                                    eprintln!("Failed to fetch transaction details: {}",error);
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            println!("No Latest Transaction found\n");
-                        }
-                        Err(error) =>{
-                            println!("Failed to fetch latest transaction: {}\n",error);
-                        }
+                    if let Err(err) = event_sender.send(event).await{
+                        eprintln!("Event processor stopped for {wallet_address}: {err}");
+                        break;
                     }
-                    println!("-----------------------------------");
-
-                }else{
-                    println!("Server Message: {}",parsed);
                 }
             }
             Ok(Message::Ping(_)) => {
@@ -125,6 +98,94 @@ async fn main() {
                 break;
             }
         }
+    }
+}
+
+#[tokio::main]
+async fn main(){
+    let client = reqwest::Client::new();
+
+    let wallets_file = fs::read_to_string("wallets.txt")
+        .expect("Failed to read wallets.txt");
+
+    let wallets: Vec<String> = wallets_file
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    if wallets.is_empty() {
+        eprintln!("No wallet addresses found in wallets.txt");
+        return;
+    }
+
+    println!("Loaded {} wallet(s)", wallets.len());
+
+    for wallet in &wallets {
+        println!("- {}", wallet);
+    }
+
+    let (event_sender, mut event_receiver) = mpsc::channel::<WalletEvent>(100);
+
+    for wallet_address in wallets{
+        let sender_for_task = event_sender.clone();
+
+        tokio::spawn(async move{
+            watch_wallet(wallet_address, sender_for_task).await;
+        });
+    }
+    drop(event_sender);
+
+
+    while let Some(event) = event_receiver.recv().await {
+        let balance_sol = event.lamports as f64 / 1_000_000_000.0;
+
+        println!("\nNew account change detected!");
+        println!("Wallet: {}", event.wallet_address);
+        println!("Slot: {}", event.slot);
+        println!("Balance: {:.9} SOL", balance_sol);
+        println!("Lamports: {}", event.lamports);
+
+        match fetch_latest_transaction(&client, &event.wallet_address).await {
+            Ok(Some(signature)) => {
+                println!("Latest transaction: {}", signature);
+
+                match fetch_transaction_with_retry(&client, &signature, &event.wallet_address).await {
+                    Ok(Some(details)) => {
+                        let balance_change_sol = details.wallet_balance_change_lamports as f64 / 1_000_000_000.0;
+                        println!("\nTransaction details");
+                        println!("Status: {}",if details.success { "Success" } else { "Failed" } );
+                        println!("Transaction slot: {}", details.slot);
+
+                        match details.block_time {
+                            Some(time) => println!("Block time (Unix): {}", time),
+                            None => println!("Block time: unavailable"),
+                        }
+                        println!("Fee: {:.9} SOL", details.fee as f64 / 1_000_000_000.0 );
+                        println!("Wallet SOL change: {:.9} SOL", balance_change_sol);
+                    }
+
+                    Ok(None) => {
+                        println!("Transaction details are not available after retries.");
+                    }
+
+                    Err(error) => {
+                        eprintln!("Failed to fetch transaction details: {}", error);
+                    }
+                }
+            }
+
+            Ok(None) => {
+                println!("No recent transaction found.");
+            }
+
+            Err(error) => {
+                eprintln!("Failed to fetch latest transaction: {}", error);
+            }
+        }
+
+        println!("-----------------------------------");
     }
 }
 
