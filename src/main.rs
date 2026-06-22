@@ -4,7 +4,7 @@ use tokio_tungstenite::{connect_async};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use tokio_tungstenite::tungstenite::Message;
-
+use tokio::time::{sleep, Duration};
 
 const DEVNET_HTTP_URL: &str = "https://api.devnet.solana.com";
 const DEVNET_WS_URL: &str = "wss://api.devnet.solana.com";
@@ -78,7 +78,7 @@ async fn main() {
                         Ok(Some(signature)) => {
                             println!("Latest transaction: {}\n", signature);
 
-                            match fetch_transaction_details(&client, &signature, wallet_address).await{
+                            match fetch_transaction_with_retry(&client, &signature, wallet_address).await{
                                 Ok(Some(tnx_details)) =>{
                                     println!("\nTransaction details");
                                     println!("Success: {}", if tnx_details.success { "Success" } else { "Failed" });
@@ -232,4 +232,25 @@ async fn fetch_transaction_details(client: &Client, signature: &str, wallet_addr
         success,
         wallet_balance_change_lamports
     }))
+}
+
+async fn fetch_transaction_with_retry(client: &Client, signature: &str, wallet_address: &str)-> Result<Option<TransactionDetails>, reqwest::Error>{
+    let max_try = 3;
+
+    for i in 1..=max_try{
+        match fetch_transaction_details(client, signature, wallet_address).await{
+            Ok(Some(details))=>{
+                return Ok(Some(details));
+            }
+            Ok(None) =>{
+                println!("Transaction details not ready yet. Retry {}/{}...",i,max_try);
+                sleep(Duration::from_millis(500)).await;
+            }
+            Err(error)=>{
+                return Err(error);
+            }
+        }
+    }
+
+    Ok(None)
 }
