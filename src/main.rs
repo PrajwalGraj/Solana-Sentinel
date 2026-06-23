@@ -8,12 +8,13 @@ use tokio::{sync::broadcast::error, time::{Duration, sleep}};
 use std::fs;
 use tokio::sync::mpsc;
 use std::sync::Arc;
+use sqlx::FromRow;
+use std::env;
 
 use sqlx::postgres::PgPoolOptions;
 
 const DEVNET_HTTP_URL: &str = "https://api.devnet.solana.com";
 const DEVNET_WS_URL: &str = "wss://api.devnet.solana.com";
-const DATABASE_URL: &str = "postgres://sentinel:sentinel_password@localhost:5432/solana_sentinel";
 
 #[derive(Debug)]
 struct TransactionDetails{
@@ -29,6 +30,16 @@ struct WalletEvent {
     wallet_address: String,
     slot: u64,
     lamports: u64,
+}
+
+#[derive(Debug, FromRow)]
+struct StoredTransaction {
+    signature: String,
+    transaction_slot: i64,
+    success: bool,
+    fee_lamports: i64,
+    wallet_balance_change_lamports: i64,
+    block_time: Option<i64>,
 }
 
 async fn watch_wallet(wallet_address: String, event_sender: mpsc::Sender<WalletEvent>){
@@ -107,13 +118,29 @@ async fn watch_wallet(wallet_address: String, event_sender: mpsc::Sender<WalletE
 #[tokio::main]
 async fn main(){
 
+    dotenvy::dotenv().ok();
+
+    let database_url =
+        env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+
     let db_pool = PgPoolOptions::new()
         .max_connections(5)
-        .connect(DATABASE_URL)
+        .connect(&database_url)
         .await
         .expect("Failed to connect to PostgreSQL");
 
     println!("Connected to PostgreSQL!");
+
+    let args: Vec<String> = env::args().collect();
+
+    if args.len() >= 3 && args[1] == "history" {
+        let wallet_address = &args[2];
+
+        if let Err(error) = show_history(&db_pool, wallet_address).await {
+            eprintln!("Failed to fetch history: {error}");
+        }
+        return;
+    }
 
     let client = reqwest::Client::new();
 
@@ -377,6 +404,55 @@ async fn save_transaction( db_pool: &sqlx::PgPool, wallet_address: &str, signatu
     .bind(details.block_time)
     .execute(db_pool)
     .await?;
+
+    Ok(())
+}
+
+
+async fn show_history( db_pool: &sqlx::PgPool, wallet_address: &str ) -> Result<(), sqlx::Error> {
+    let transactions = sqlx::query_as::<_, StoredTransaction>(
+        r#"
+        SELECT
+            signature,
+            transaction_slot,
+            success,
+            fee_lamports,
+            wallet_balance_change_lamports,
+            block_time
+        FROM transactions
+        WHERE wallet_address = $1
+        ORDER BY transaction_slot DESC
+        LIMIT 10
+        "#,
+    )
+    .bind(wallet_address)
+    .fetch_all(db_pool)
+    .await?;
+
+    if transactions.is_empty() {
+        println!("No stored transactions found for {wallet_address}");
+        return Ok(());
+    }
+
+    println!("\nRecent transactions for {}\n",wallet_address);
+
+    for transaction in transactions {
+        let sol_change = transaction.wallet_balance_change_lamports as f64 / 1_000_000_000.0;
+        let fee_sol = transaction.fee_lamports as f64 / 1_000_000_000.0;
+
+        println!("Signature: {}", transaction.signature);
+        println!("Status: {}",if transaction.success { "Success" } else { "Failed" });
+        println!("Transaction slot: {}", transaction.transaction_slot);
+        println!("SOL change: {:.9} SOL", sol_change);
+        println!("Fee: {:.9} SOL", fee_sol);
+
+        match transaction.block_time {
+            Some(time) => println!("Block time (Unix): {time}"),
+            None => println!("Block time: unavailable"),
+        }
+
+        println!("-----------------------------------");
+    }
 
     Ok(())
 }

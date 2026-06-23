@@ -1486,6 +1486,7 @@ dependencies = [
 name = "solana-sentinel"
 version = "0.1.0"
 dependencies = [
+ "dotenvy",
  "futures-util",
  "reqwest",
  "serde_json",
