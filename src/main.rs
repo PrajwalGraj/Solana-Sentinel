@@ -9,8 +9,11 @@ use std::fs;
 use tokio::sync::mpsc;
 use std::sync::Arc;
 
+use sqlx::postgres::PgPoolOptions;
+
 const DEVNET_HTTP_URL: &str = "https://api.devnet.solana.com";
 const DEVNET_WS_URL: &str = "wss://api.devnet.solana.com";
+const DATABASE_URL: &str = "postgres://sentinel:sentinel_password@localhost:5432/solana_sentinel";
 
 #[derive(Debug)]
 struct TransactionDetails{
@@ -103,6 +106,15 @@ async fn watch_wallet(wallet_address: String, event_sender: mpsc::Sender<WalletE
 
 #[tokio::main]
 async fn main(){
+
+    let db_pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(DATABASE_URL)
+        .await
+        .expect("Failed to connect to PostgreSQL");
+
+    println!("Connected to PostgreSQL!");
+
     let client = reqwest::Client::new();
 
     let wallets_file = fs::read_to_string("wallets.txt")
@@ -139,6 +151,23 @@ async fn main(){
 
 
     while let Some(event) = event_receiver.recv().await {
+
+        match sqlx::query(
+            r#"
+            INSERT INTO wallet_events (wallet_address, account_slot, lamports)
+            VALUES ($1, $2, $3)
+            "#,
+        )
+        .bind(&event.wallet_address)
+        .bind(event.slot as i64)
+        .bind(event.lamports as i64)
+        .execute(&db_pool)
+        .await
+        {
+            Ok(_) => println!("Event saved to PostgreSQL."),
+            Err(error) => eprintln!("Failed to save event to PostgreSQL: {error}"),
+        }
+
         let balance_sol = event.lamports as f64 / 1_000_000_000.0;
 
         println!("\nNew account change detected!");
@@ -153,6 +182,12 @@ async fn main(){
 
                 match fetch_transaction_with_retry(&client, &signature, &event.wallet_address).await {
                     Ok(Some(details)) => {
+
+                        match save_transaction( &db_pool, &event.wallet_address, &signature, &details ).await {
+                            Ok(_) => println!("Transaction saved to PostgreSQL."),
+                            Err(error) => eprintln!("Failed to save transaction: {error}"),
+                        }
+
                         let balance_change_sol = details.wallet_balance_change_lamports as f64 / 1_000_000_000.0;
                         println!("\nTransaction details");
                         println!("Status: {}",if details.success { "Success" } else { "Failed" } );
@@ -314,4 +349,34 @@ async fn fetch_transaction_with_retry(client: &Client, signature: &str, wallet_a
     }
 
     Ok(None)
+}
+
+async fn save_transaction( db_pool: &sqlx::PgPool, wallet_address: &str, signature: &str,details: &TransactionDetails ) -> Result<(), sqlx::Error> {
+
+    sqlx::query(
+        r#"
+        INSERT INTO transactions (
+            wallet_address,
+            signature,
+            transaction_slot,
+            success,
+            fee_lamports,
+            wallet_balance_change_lamports,
+            block_time
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (wallet_address, signature) DO NOTHING
+        "#,
+    )
+    .bind(wallet_address)
+    .bind(signature)
+    .bind(details.slot as i64)
+    .bind(details.success)
+    .bind(details.fee as i64)
+    .bind(details.wallet_balance_change_lamports)
+    .bind(details.block_time)
+    .execute(db_pool)
+    .await?;
+
+    Ok(())
 }
