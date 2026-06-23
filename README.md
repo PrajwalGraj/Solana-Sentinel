@@ -85,6 +85,96 @@ Make sure you have installed:
 * Rust and Cargo
 * Docker Desktop
 
+## Setup
+
+### 1. Clone the repository
+
+```bash
+git clone <your-repository-url>
+cd solana-sentinel
+```
+
+### 2. Create environment file
+
+Create a `.env` file:
+
+```env
+DATABASE_URL=postgres://sentinel:sentinel_password@localhost:5432/solana_sentinel
+```
+
+You can use `.env.example` as a reference.
+
+### 3. Add wallet addresses
+
+Create or update `wallets.txt`:
+
+```text
+9mSSAxDAcHgR2mAu39Xw9pn7yjB2xHRsiV16bnUSWfcK
+EC2SsCi68tmnLga7HGdD8aZZ4LGBfZoTKy8ESz8p3FTb
+```
+
+Use valid Solana Devnet wallet addresses, one per line.
+
+### 4. Start PostgreSQL
+
+```bash
+docker compose up -d
+```
+
+Check that PostgreSQL is running:
+
+```bash
+docker compose ps
+```
+
+### 5. Create database tables
+
+Open PostgreSQL:
+
+```bash
+docker compose exec postgres psql -U sentinel -d solana_sentinel
+```
+
+Create the wallet events table:
+
+```sql
+CREATE TABLE wallet_events (
+    id BIGSERIAL PRIMARY KEY,
+    wallet_address TEXT NOT NULL,
+    account_slot BIGINT NOT NULL,
+    lamports BIGINT NOT NULL,
+    detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+Create the transactions table:
+
+```sql
+CREATE TABLE transactions (
+    id BIGSERIAL PRIMARY KEY,
+    wallet_address TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    transaction_slot BIGINT NOT NULL,
+    success BOOLEAN NOT NULL,
+    fee_lamports BIGINT NOT NULL,
+    wallet_balance_change_lamports BIGINT NOT NULL,
+    block_time BIGINT,
+    fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (wallet_address, signature)
+);
+```
+
+Exit PostgreSQL:
+
+```sql
+\q
+```
+
+### 6. Run the watcher
+
+```bash
+cargo run
+```
 
 ## Example Output
 
@@ -140,6 +230,32 @@ Block time (Unix): 1782188000
 -----------------------------------
 ```
 
+## Database Queries
+
+View recent wallet events:
+
+```sql
+SELECT *
+FROM wallet_events
+ORDER BY id DESC
+LIMIT 10;
+```
+
+View recent transactions:
+
+```sql
+SELECT
+    wallet_address,
+    signature,
+    transaction_slot,
+    success,
+    fee_lamports,
+    wallet_balance_change_lamports,
+    block_time
+FROM transactions
+ORDER BY id DESC
+LIMIT 10;
+```
 
 ## What I Learned
 
